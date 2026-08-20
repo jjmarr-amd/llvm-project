@@ -14,8 +14,7 @@
 #include <string>
 
 using namespace llvm;
-using namespace lldb;
-using namespace lldb_private;
+using namespace lldb_private::transport;
 
 char TransportUnhandledContentsError::ID;
 
@@ -23,10 +22,43 @@ TransportUnhandledContentsError::TransportUnhandledContentsError(
     std::string unhandled_contents)
     : m_unhandled_contents(unhandled_contents) {}
 
-void TransportUnhandledContentsError::log(llvm::raw_ostream &OS) const {
+void TransportUnhandledContentsError::log(raw_ostream &OS) const {
   OS << "transport EOF with unhandled contents: '" << m_unhandled_contents
      << "'";
 }
 std::error_code TransportUnhandledContentsError::convertToErrorCode() const {
   return std::make_error_code(std::errc::bad_message);
+}
+
+char InvalidParams::ID;
+
+void InvalidParams::log(raw_ostream &OS) const {
+  OS << "invalid parameters for method '" << m_method << "': '" << m_context
+     << "'";
+}
+std::error_code InvalidParams::convertToErrorCode() const {
+  // JSON-RPC Invalid params
+  return std::error_code(InvalidParams::kErrorCode, std::generic_category());
+}
+
+char InvalidMessage::ID;
+
+void InvalidMessage::log(raw_ostream &OS) const {
+  OS << "invalid message '" << m_raw_message << "': '" << m_reason << "'";
+}
+
+std::error_code InvalidMessage::convertToErrorCode() const {
+  // JSON-RPC Parse error
+  return std::error_code(InvalidMessage::kErrorCode, std::generic_category());
+}
+
+char MethodNotFound::ID;
+
+void MethodNotFound::log(raw_ostream &OS) const {
+  OS << "method not found: '" << m_method << "'";
+}
+
+std::error_code MethodNotFound::convertToErrorCode() const {
+  // JSON-RPC Method not found
+  return std::error_code(MethodNotFound::kErrorCode, std::generic_category());
 }

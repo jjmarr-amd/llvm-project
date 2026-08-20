@@ -135,6 +135,14 @@ JITEngine::JITEngine(Triple::ArchType TA) : TT(Triple::getArchTypeName(TA)) {
     LLVMInitializeAMDGPUAsmPrinter();
   }
 #endif
+#ifdef LIBOMPTARGET_JIT_SPIRV
+  if (TT.isSPIRV()) {
+    LLVMInitializeSPIRVTargetInfo();
+    LLVMInitializeSPIRVTarget();
+    LLVMInitializeSPIRVTargetMC();
+    LLVMInitializeSPIRVAsmPrinter();
+  }
+#endif
 }
 
 void JITEngine::opt(TargetMachine *TM, TargetLibraryInfoImpl *TLII, Module &M,
@@ -180,9 +188,10 @@ Expected<std::unique_ptr<MemoryBuffer>>
 JITEngine::backend(Module &M, const std::string &ComputeUnitKind,
                    unsigned OptLevel) {
 
-  auto RemarksFileOrErr = setupLLVMOptimizationRemarks(
-      M.getContext(), /*RemarksFilename=*/"", /*RemarksPasses=*/"",
-      /*RemarksFormat=*/"", /*RemarksWithHotness=*/false);
+  Expected<LLVMRemarkFileHandle> RemarksFileOrErr =
+      setupLLVMOptimizationRemarks(
+          M.getContext(), /*RemarksFilename=*/"", /*RemarksPasses=*/"",
+          /*RemarksFormat=*/"", /*RemarksWithHotness=*/false);
   if (Error E = RemarksFileOrErr.takeError())
     return std::move(E);
   if (*RemarksFileOrErr)
@@ -291,5 +300,16 @@ JITEngine::process(StringRef Image, target::plugin::GenericDeviceTy &Device) {
     return Device.doJITPostProcessing(std::move(MB));
   };
 
-  return compile(Image, ComputeUnitKind, PostProcessing);
+  auto ImageOrError = compile(Image, ComputeUnitKind, PostProcessing);
+
+  if (SaveImageFileName.isPresent() && ImageOrError) {
+    std::error_code EC;
+    raw_fd_ostream OS(SaveImageFileName.get(), EC);
+    if (EC)
+      return createStringError(error::ErrorCode::HOST_IO,
+                               "saving JIT image file\n");
+    OS << ImageOrError.get()->getBuffer();
+    OS.close();
+  }
+  return ImageOrError;
 }

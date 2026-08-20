@@ -21,6 +21,7 @@
 #include "clang/AST/StmtCXX.h"
 #include "clang/Basic/OpenMPKinds.h"
 #include "clang/Basic/SourceLocation.h"
+#include "llvm/Support/Casting.h"
 
 namespace clang {
 
@@ -677,6 +678,10 @@ public:
   }
 };
 
+// Forward declaration of a generic loop transformation. Used in the declaration
+// of OMPLoopBasedDirective.
+class OMPLoopTransformationDirective;
+
 /// The base class for all loop-based directives, including loop transformation
 /// directives.
 class OMPLoopBasedDirective : public OMPExecutableDirective {
@@ -889,24 +894,23 @@ public:
 
   /// Calls the specified callback function for all the loops in \p CurStmt,
   /// from the outermost to the innermost.
-  static bool doForAllLoops(
-      Stmt *CurStmt, bool TryImperfectlyNestedLoops, unsigned NumLoops,
-      llvm::function_ref<bool(unsigned, Stmt *)> Callback,
-      llvm::function_ref<void(OMPCanonicalLoopNestTransformationDirective *)>
-          OnTransformationCallback);
+  static bool
+  doForAllLoops(Stmt *CurStmt, bool TryImperfectlyNestedLoops,
+                unsigned NumLoops,
+                llvm::function_ref<bool(unsigned, Stmt *)> Callback,
+                llvm::function_ref<void(OMPLoopTransformationDirective *)>
+                    OnTransformationCallback);
   static bool
   doForAllLoops(const Stmt *CurStmt, bool TryImperfectlyNestedLoops,
                 unsigned NumLoops,
                 llvm::function_ref<bool(unsigned, const Stmt *)> Callback,
-                llvm::function_ref<
-                    void(const OMPCanonicalLoopNestTransformationDirective *)>
+                llvm::function_ref<void(const OMPLoopTransformationDirective *)>
                     OnTransformationCallback) {
     auto &&NewCallback = [Callback](unsigned Cnt, Stmt *CurStmt) {
       return Callback(Cnt, CurStmt);
     };
     auto &&NewTransformCb =
-        [OnTransformationCallback](
-            OMPCanonicalLoopNestTransformationDirective *A) {
+        [OnTransformationCallback](OMPLoopTransformationDirective *A) {
           OnTransformationCallback(A);
         };
     return doForAllLoops(const_cast<Stmt *>(CurStmt), TryImperfectlyNestedLoops,
@@ -919,7 +923,7 @@ public:
   doForAllLoops(Stmt *CurStmt, bool TryImperfectlyNestedLoops,
                 unsigned NumLoops,
                 llvm::function_ref<bool(unsigned, Stmt *)> Callback) {
-    auto &&TransformCb = [](OMPCanonicalLoopNestTransformationDirective *) {};
+    auto &&TransformCb = [](OMPLoopTransformationDirective *) {};
     return doForAllLoops(CurStmt, TryImperfectlyNestedLoops, NumLoops, Callback,
                          TransformCb);
   }
@@ -957,9 +961,11 @@ public:
 };
 
 /// Common class of data shared between
-/// OMPCanonicalLoopNestTransformationDirective and transformations over
-/// canonical loop sequences.
+/// OMPCanonicalLoopNestTransformationDirective and
+/// OMPCanonicalLoopSequenceTransformationDirective
 class OMPLoopTransformationDirective {
+  friend class ASTStmtReader;
+
   /// Number of (top-level) generated loops.
   /// This value is 1 for most transformations as they only map one loop nest
   /// into another.
@@ -969,14 +975,38 @@ class OMPLoopTransformationDirective {
   /// generate more than one loop nest, so the value would be >= 1.
   unsigned NumGeneratedTopLevelLoops = 1;
 
+  /// We need this because we cannot easily make OMPLoopTransformationDirective
+  /// a proper Stmt.
+  Stmt *S = nullptr;
+
 protected:
   void setNumGeneratedTopLevelLoops(unsigned N) {
     NumGeneratedTopLevelLoops = N;
   }
 
+  explicit OMPLoopTransformationDirective(Stmt *S) : S(S) {}
+
 public:
   unsigned getNumGeneratedTopLevelLoops() const {
     return NumGeneratedTopLevelLoops;
+  }
+
+  /// Returns the specific directive related to this loop transformation.
+  Stmt *getDirective() const { return S; }
+
+  /// Get the de-sugared statements after the loop transformation.
+  ///
+  /// Might be nullptr if either the directive generates no loops and is handled
+  /// directly in CodeGen, or resolving a template-dependence context is
+  /// required.
+  Stmt *getTransformedStmt() const;
+
+  /// Return preinits statement.
+  Stmt *getPreInits() const;
+
+  static bool classof(const Stmt *T) {
+    return isa<OMPCanonicalLoopNestTransformationDirective,
+               OMPCanonicalLoopSequenceTransformationDirective>(T);
   }
 };
 
@@ -990,7 +1020,8 @@ protected:
   explicit OMPCanonicalLoopNestTransformationDirective(
       StmtClass SC, OpenMPDirectiveKind Kind, SourceLocation StartLoc,
       SourceLocation EndLoc, unsigned NumAssociatedLoops)
-      : OMPLoopBasedDirective(SC, Kind, StartLoc, EndLoc, NumAssociatedLoops) {}
+      : OMPLoopBasedDirective(SC, Kind, StartLoc, EndLoc, NumAssociatedLoops),
+        OMPLoopTransformationDirective(this) {}
 
 public:
   /// Return the number of associated (consumed) loops.
@@ -2900,13 +2931,13 @@ public:
   }
 };
 
-/// This represents '#pragma omp ordered' directive.
+/// This represents standalone '#pragma omp ordered' directive.
 ///
 /// \code
 /// #pragma omp ordered
 /// \endcode
 ///
-class OMPOrderedDirective : public OMPExecutableDirective {
+class OMPOrderedStandaloneDirective : public OMPExecutableDirective {
   friend class ASTStmtReader;
   friend class OMPExecutableDirective;
   /// Build directive with the given start and end location.
@@ -2914,16 +2945,70 @@ class OMPOrderedDirective : public OMPExecutableDirective {
   /// \param StartLoc Starting location of the directive kind.
   /// \param EndLoc Ending location of the directive.
   ///
-  OMPOrderedDirective(SourceLocation StartLoc, SourceLocation EndLoc)
-      : OMPExecutableDirective(OMPOrderedDirectiveClass,
-                               llvm::omp::OMPD_ordered, StartLoc, EndLoc) {}
+  OMPOrderedStandaloneDirective(SourceLocation StartLoc, SourceLocation EndLoc)
+      : OMPExecutableDirective(OMPOrderedStandaloneDirectiveClass,
+                               llvm::omp::OMPD_ordered_standalone, StartLoc,
+                               EndLoc) {}
 
   /// Build an empty directive.
   ///
-  explicit OMPOrderedDirective()
-      : OMPExecutableDirective(OMPOrderedDirectiveClass,
-                               llvm::omp::OMPD_ordered, SourceLocation(),
-                               SourceLocation()) {}
+  explicit OMPOrderedStandaloneDirective()
+      : OMPExecutableDirective(OMPOrderedStandaloneDirectiveClass,
+                               llvm::omp::OMPD_ordered_standalone,
+                               SourceLocation(), SourceLocation()) {}
+
+public:
+  /// Creates directive.
+  ///
+  /// \param C AST context.
+  /// \param StartLoc Starting location of the directive kind.
+  /// \param EndLoc Ending Location of the directive.
+  /// \param Clauses List of clauses.
+  ///
+  static OMPOrderedStandaloneDirective *Create(const ASTContext &C,
+                                               SourceLocation StartLoc,
+                                               SourceLocation EndLoc,
+                                               ArrayRef<OMPClause *> Clauses);
+
+  /// Creates an empty directive.
+  ///
+  /// \param C AST context.
+  /// \param NumClauses Number of clauses.
+  ///
+  static OMPOrderedStandaloneDirective *
+  CreateEmpty(const ASTContext &C, unsigned NumClauses, EmptyShell);
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == OMPOrderedStandaloneDirectiveClass;
+  }
+};
+
+/// This represents block-associated '#pragma omp ordered' directive.
+///
+/// \code
+/// #pragma omp ordered
+/// { body }
+/// \endcode
+///
+class OMPOrderedBlockAssocDirective : public OMPExecutableDirective {
+  friend class ASTStmtReader;
+  friend class OMPExecutableDirective;
+  /// Build directive with the given start and end location.
+  ///
+  /// \param StartLoc Starting location of the directive kind.
+  /// \param EndLoc Ending location of the directive.
+  ///
+  OMPOrderedBlockAssocDirective(SourceLocation StartLoc, SourceLocation EndLoc)
+      : OMPExecutableDirective(OMPOrderedBlockAssocDirectiveClass,
+                               llvm::omp::OMPD_ordered_blockassoc, StartLoc,
+                               EndLoc) {}
+
+  /// Build an empty directive.
+  ///
+  explicit OMPOrderedBlockAssocDirective()
+      : OMPExecutableDirective(OMPOrderedBlockAssocDirectiveClass,
+                               llvm::omp::OMPD_ordered_blockassoc,
+                               SourceLocation(), SourceLocation()) {}
 
 public:
   /// Creates directive.
@@ -2934,7 +3019,7 @@ public:
   /// \param Clauses List of clauses.
   /// \param AssociatedStmt Statement, associated with the directive.
   ///
-  static OMPOrderedDirective *
+  static OMPOrderedBlockAssocDirective *
   Create(const ASTContext &C, SourceLocation StartLoc, SourceLocation EndLoc,
          ArrayRef<OMPClause *> Clauses, Stmt *AssociatedStmt);
 
@@ -2942,14 +3027,12 @@ public:
   ///
   /// \param C AST context.
   /// \param NumClauses Number of clauses.
-  /// \param IsStandalone true, if the standalone directive is created.
   ///
-  static OMPOrderedDirective *CreateEmpty(const ASTContext &C,
-                                          unsigned NumClauses,
-                                          bool IsStandalone, EmptyShell);
+  static OMPOrderedBlockAssocDirective *
+  CreateEmpty(const ASTContext &C, unsigned NumClauses, EmptyShell);
 
   static bool classof(const Stmt *T) {
-    return T->getStmtClass() == OMPOrderedDirectiveClass;
+    return T->getStmtClass() == OMPOrderedBlockAssocDirectiveClass;
   }
 };
 
@@ -5928,6 +6011,190 @@ public:
   }
 };
 
+/// The base class for all transformation directives of canonical loop
+/// sequences (currently only 'fuse')
+class OMPCanonicalLoopSequenceTransformationDirective
+    : public OMPExecutableDirective,
+      public OMPLoopTransformationDirective {
+  friend class ASTStmtReader;
+
+protected:
+  explicit OMPCanonicalLoopSequenceTransformationDirective(
+      StmtClass SC, OpenMPDirectiveKind Kind, SourceLocation StartLoc,
+      SourceLocation EndLoc)
+      : OMPExecutableDirective(SC, Kind, StartLoc, EndLoc),
+        OMPLoopTransformationDirective(this) {}
+
+public:
+  /// Get the de-sugared statements after the loop transformation.
+  ///
+  /// Might be nullptr if either the directive generates no loops and is handled
+  /// directly in CodeGen, or resolving a template-dependence context is
+  /// required.
+  Stmt *getTransformedStmt() const;
+
+  /// Return preinits statement.
+  Stmt *getPreInits() const;
+
+  static bool classof(const Stmt *T) {
+    Stmt::StmtClass C = T->getStmtClass();
+    return C == OMPFuseDirectiveClass;
+  }
+};
+
+/// Represents the '#pragma omp fuse' loop transformation directive
+///
+/// \code{c}
+/// #pragma omp fuse
+/// {
+///   for(int i = 0; i < m1; ++i) {...}
+///   for(int j = 0; j < m2; ++j) {...}
+///   ...
+/// }
+/// \endcode
+class OMPFuseDirective final
+    : public OMPCanonicalLoopSequenceTransformationDirective {
+  friend class ASTStmtReader;
+  friend class OMPExecutableDirective;
+
+  // Offsets of child members.
+  enum {
+    PreInitsOffset = 0,
+    TransformedStmtOffset,
+  };
+
+  explicit OMPFuseDirective(SourceLocation StartLoc, SourceLocation EndLoc)
+      : OMPCanonicalLoopSequenceTransformationDirective(
+            OMPFuseDirectiveClass, llvm::omp::OMPD_fuse, StartLoc, EndLoc) {}
+
+  void setPreInits(Stmt *PreInits) {
+    Data->getChildren()[PreInitsOffset] = PreInits;
+  }
+
+  void setTransformedStmt(Stmt *S) {
+    Data->getChildren()[TransformedStmtOffset] = S;
+  }
+
+public:
+  /// Create a new AST node representation for #pragma omp fuse'
+  ///
+  /// \param C Context of the AST
+  /// \param StartLoc Location of the introducer (e.g the 'omp' token)
+  /// \param EndLoc Location of the directive's end (e.g the tok::eod)
+  /// \param Clauses The directive's clauses
+  /// \param NumLoops Total number of loops in the canonical loop sequence.
+  /// \param NumGeneratedTopLevelLoops Number of top-level generated loops.
+  //                                   Typically 1 but looprange clause can
+  //                                   change this.
+  /// \param AssociatedStmt The outermost associated loop
+  /// \param TransformedStmt The loop nest after fusion, or nullptr in
+  ///                        dependent
+  /// \param PreInits Helper preinits statements for the loop nest
+  static OMPFuseDirective *
+  Create(const ASTContext &C, SourceLocation StartLoc, SourceLocation EndLoc,
+         ArrayRef<OMPClause *> Clauses, unsigned NumGeneratedTopLevelLoops,
+         Stmt *AssociatedStmt, Stmt *TransformedStmt, Stmt *PreInits);
+
+  /// Build an empty '#pragma omp fuse' AST node for deserialization
+  ///
+  /// \param C Context of the AST
+  /// \param NumClauses Number of clauses to allocate
+  /// \param NumLoops Number of top level loops to allocate
+  static OMPFuseDirective *CreateEmpty(const ASTContext &C,
+                                       unsigned NumClauses);
+
+  /// Gets the associated loops after the transformation. This is the de-sugared
+  /// replacement or nulltpr in dependent contexts.
+  Stmt *getTransformedStmt() const {
+    return Data->getChildren()[TransformedStmtOffset];
+  }
+
+  /// Return preinits statement.
+  Stmt *getPreInits() const { return Data->getChildren()[PreInitsOffset]; }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == OMPFuseDirectiveClass;
+  }
+};
+
+/// Represents the '#pragma omp split' loop transformation directive.
+///
+/// \code{.c}
+///   #pragma omp split counts(3, omp_fill, 2)
+///   for (int i = 0; i < n; ++i)
+///     ...
+/// \endcode
+///
+/// This directive transforms a single loop into multiple loops based on
+/// index ranges. The transformation splits the iteration space of the loop
+/// into multiple contiguous ranges. The \c counts clause is required and
+/// exactly one list item must be \c omp_fill.
+class OMPSplitDirective final
+    : public OMPCanonicalLoopNestTransformationDirective {
+  friend class ASTStmtReader;
+  friend class OMPExecutableDirective;
+
+  /// Offsets of child members.
+  enum {
+    PreInitsOffset = 0,
+    TransformedStmtOffset,
+  };
+
+  explicit OMPSplitDirective(SourceLocation StartLoc, SourceLocation EndLoc,
+                             unsigned NumLoops)
+      : OMPCanonicalLoopNestTransformationDirective(
+            OMPSplitDirectiveClass, llvm::omp::OMPD_split, StartLoc, EndLoc,
+            NumLoops) {}
+
+  void setPreInits(Stmt *PreInits) {
+    Data->getChildren()[PreInitsOffset] = PreInits;
+  }
+
+  void setTransformedStmt(Stmt *S) {
+    Data->getChildren()[TransformedStmtOffset] = S;
+  }
+
+public:
+  /// Create a new AST node representation for '#pragma omp split'.
+  ///
+  /// \param C         Context of the AST.
+  /// \param StartLoc  Location of the introducer (e.g. the 'omp' token).
+  /// \param EndLoc    Location of the directive's end (e.g. the tok::eod).
+  /// \param Clauses   The directive's clauses (e.g. the required \c counts
+  ///                  clause).
+  /// \param NumLoops  Number of affected loops (should be 1 for split).
+  /// \param AssociatedStmt  The outermost associated loop.
+  /// \param TransformedStmt The loop nest after splitting, or nullptr in
+  ///                        dependent contexts.
+  /// \param PreInits   Helper preinits statements for the loop nest.
+  static OMPSplitDirective *Create(const ASTContext &C, SourceLocation StartLoc,
+                                   SourceLocation EndLoc,
+                                   ArrayRef<OMPClause *> Clauses,
+                                   unsigned NumLoops, Stmt *AssociatedStmt,
+                                   Stmt *TransformedStmt, Stmt *PreInits);
+
+  /// Build an empty '#pragma omp split' AST node for deserialization.
+  ///
+  /// \param C          Context of the AST.
+  /// \param NumClauses Number of clauses to allocate.
+  /// \param NumLoops   Number of associated loops to allocate.
+  static OMPSplitDirective *CreateEmpty(const ASTContext &C,
+                                        unsigned NumClauses, unsigned NumLoops);
+
+  /// Gets/sets the associated loops after the transformation, i.e. after
+  /// de-sugaring.
+  Stmt *getTransformedStmt() const {
+    return Data->getChildren()[TransformedStmtOffset];
+  }
+
+  /// Return preinits statement.
+  Stmt *getPreInits() const { return Data->getChildren()[PreInitsOffset]; }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == OMPSplitDirectiveClass;
+  }
+};
+
 /// This represents '#pragma omp scan' directive.
 ///
 /// \code
@@ -6595,5 +6862,38 @@ public:
 };
 
 } // end namespace clang
+
+namespace llvm {
+// Allow a Stmt* be casted correctly to an OMPLoopTransformationDirective*.
+// The default routines would just use a C-style cast which won't work well
+// for the multiple inheritance here. We have to use a static cast from the
+// corresponding subclass.
+template <>
+struct CastInfo<clang::OMPLoopTransformationDirective, clang::Stmt *>
+    : public NullableValueCastFailed<clang::OMPLoopTransformationDirective *>,
+      public DefaultDoCastIfPossible<
+          clang::OMPLoopTransformationDirective *, clang::Stmt *,
+          CastInfo<clang::OMPLoopTransformationDirective, clang::Stmt *>> {
+  static bool isPossible(const clang::Stmt *T) {
+    return clang::OMPLoopTransformationDirective::classof(T);
+  }
+
+  static clang::OMPLoopTransformationDirective *doCast(clang::Stmt *T) {
+    if (auto *D =
+            dyn_cast<clang::OMPCanonicalLoopNestTransformationDirective>(T))
+      return static_cast<clang::OMPLoopTransformationDirective *>(D);
+    if (auto *D =
+            dyn_cast<clang::OMPCanonicalLoopSequenceTransformationDirective>(T))
+      return static_cast<clang::OMPLoopTransformationDirective *>(D);
+    llvm_unreachable("unexpected type");
+  }
+};
+template <>
+struct CastInfo<clang::OMPLoopTransformationDirective, const clang::Stmt *>
+    : public ConstStrippingForwardingCast<
+          clang::OMPLoopTransformationDirective, const clang::Stmt *,
+          CastInfo<clang::OMPLoopTransformationDirective, clang::Stmt *>> {};
+
+} // namespace llvm
 
 #endif

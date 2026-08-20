@@ -20,6 +20,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/SmallVectorExtras.h"
+#include <cassert>
 #include <utility>
 
 namespace mlir {
@@ -52,16 +54,16 @@ static Value createMul(Location loc, Value x, Value y, Type accType,
 }
 
 // Generate the affine expression to compute the convolved index
-// for the input as `oIndex * stride + fIndex`,
+// for the input as `oIndex * stride + fIndex * dilation`,
 // where oIndex: output iterator; fIndex: filter iterator.
 static AffineExpr getConvolvedExpr(OpBuilder &b, int64_t stride,
-                                   bool useSymbols = true) {
+                                   int64_t dilation, bool useSymbols = true) {
   AffineExpr oExpr, fExpr;
   if (useSymbols)
     bindSymbols(b.getContext(), oExpr, fExpr);
   else
     bindDims(b.getContext(), oExpr, fExpr);
-  return AffineExpr(stride * oExpr + fExpr);
+  return AffineExpr(stride * oExpr + dilation * fExpr);
 }
 
 // Stores the affine expressions to map the iteration space of the im2col matrix
@@ -89,12 +91,14 @@ struct Im2ColToInputDimsExprs {
 ///
 /// @param exprs      Affine expressions for output and filter indices.
 /// @param strides    [height, width] stride values for the convolution.
+/// @param dilations  [height, width] dilation values for the convolution.
 /// @param rewriter   Pattern rewriter.
 /// @return           Affine expressions mapping im2col matrix indices to input
 /// offsets.
 static Im2ColToInputDimsExprs
 getIm2ColInputExpressions(Im2ColToOperandsExprs exprs,
-                          ArrayRef<int64_t> strides, RewriterBase &rewriter) {
+                          ArrayRef<int64_t> strides,
+                          ArrayRef<int64_t> dilations, RewriterBase &rewriter) {
   // maps the iteration space of the im2col matrix to (output_y, filter_y)
   auto hIndicesMap = AffineMap::inferFromExprList(
       {ArrayRef{exprs.ohIndex, exprs.fhIndex}}, rewriter.getContext())[0];
@@ -108,10 +112,10 @@ getIm2ColInputExpressions(Im2ColToOperandsExprs exprs,
   // then we compose them with the maps that map the im2col matrix elements to
   // the (out_element, filter_element) pairs.
   auto bIndexExpr = rewriter.getAffineDimExpr(0U);
-  auto hIndexExpr = getConvolvedExpr(rewriter, strides[0],
+  auto hIndexExpr = getConvolvedExpr(rewriter, strides[0], dilations[0],
                                      /*useSymbols*/ false);
   hIndexExpr = hIndexExpr.compose(hIndicesMap);
-  auto wIndexExpr = getConvolvedExpr(rewriter, strides[1],
+  auto wIndexExpr = getConvolvedExpr(rewriter, strides[1], dilations[1],
                                      /*useSymbols*/ false);
   wIndexExpr = wIndexExpr.compose(wIndicesMap);
   auto cIndexExpr = exprs.icIndex;
@@ -124,6 +128,10 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcHwcfOp convOp) {
   auto filterType = cast<ShapedType>(convOp.getInputs()[1].getType());
   auto outputType = cast<ShapedType>(convOp.getOutputs()[0].getType());
 
+  if (!convOp.hasPureTensorSemantics())
+    return rewriter.notifyMatchFailure(
+        convOp, "expected op to have pure tensor semantics");
+
   if (!filterType.hasStaticShape())
     return rewriter.notifyMatchFailure(
         convOp, "expected a static shape for the filter");
@@ -131,11 +139,6 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcHwcfOp convOp) {
   if (!inputType.hasStaticShape())
     return rewriter.notifyMatchFailure(convOp,
                                        "expected a static shape for the input");
-
-  // TODO: Support dilation.
-  if (!hasAllOneValues(convOp.getDilations()))
-    return rewriter.notifyMatchFailure(convOp,
-                                       "expected all ones for dilations");
 
   MLIRContext *context = rewriter.getContext();
   Value input = convOp.getInputs()[0];
@@ -155,10 +158,15 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcHwcfOp convOp) {
 
   Location loc = convOp.getLoc();
 
+  assert(isa<RankedTensorType>(filterType) &&
+         "expected filter type to be a ranked tensor");
+  auto tensorFilterType = cast<RankedTensorType>(filterType);
+
   // Reshape output and filter to the LHS and result of a (B)MNK matmul.
   SmallVector<ReassociationIndices> filterReassocIndices = {{0, 1, 2}, {3}};
   auto reshapedFilterType =
-      RankedTensorType::get({fh * fw * ic, oc}, filterType.getElementType());
+      RankedTensorType::get({fh * fw * ic, oc}, filterType.getElementType(),
+                            tensorFilterType.getEncoding());
   Value reshapedFilter = tensor::CollapseShapeOp::create(
       rewriter, loc, reshapedFilterType, filter, filterReassocIndices);
 
@@ -192,10 +200,10 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcHwcfOp convOp) {
   i2cToOperExprs.ohIndex = mIndicesExprs[0];
   i2cToOperExprs.owIndex = mIndicesExprs[1];
 
-  // im2col[n, oh*ow, fh*fw*ic] = input[n, sh*oh + fh, sw*ow + fw, ic]
+  // im2col[n, oh*ow, fh*fw*ic] = input[n, sh*oh + dh*fh, sw*ow + dw*fw, ic]
   Im2ColToInputDimsExprs inExprs = getIm2ColInputExpressions(
       i2cToOperExprs, llvm::to_vector(convOp.getStrides().getValues<int64_t>()),
-      rewriter);
+      llvm::to_vector(convOp.getDilations().getValues<int64_t>()), rewriter);
   auto inMap =
       AffineMap::inferFromExprList({ArrayRef{inExprs.bIndex, inExprs.hIndex,
                                              inExprs.wIndex, inExprs.cIndex}},
@@ -253,6 +261,10 @@ rewriteInIm2Col(RewriterBase &rewriter,
   auto filterType = cast<RankedTensorType>(convOp.getInputs()[1].getType());
   auto outputType = cast<RankedTensorType>(convOp.getOutputs()[0].getType());
 
+  if (!convOp.hasPureTensorSemantics())
+    return rewriter.notifyMatchFailure(
+        convOp, "expected op to have pure tensor semantics");
+
   if (!filterType.hasStaticShape())
     return rewriter.notifyMatchFailure(
         convOp, "expected a static shape for the filter");
@@ -273,13 +285,13 @@ rewriteInIm2Col(RewriterBase &rewriter,
     auto nloops = indices.size();
     ArrayRef<int64_t> inputShape = operandTensorType.getShape();
 
-    SmallVector<AffineExpr> exprs = llvm::to_vector<4>(
-        llvm::map_range(indices, [&](int64_t index) -> AffineExpr {
+    SmallVector<AffineExpr> exprs =
+        llvm::map_to_vector<4>(indices, [&](int64_t index) -> AffineExpr {
           return rewriter.getAffineDimExpr(index);
-        }));
+        });
 
-    SmallVector<int64_t> targetShape = llvm::to_vector<4>(llvm::map_range(
-        indices, [&](int64_t index) -> int64_t { return inputShape[index]; }));
+    SmallVector<int64_t> targetShape = llvm::map_to_vector<4>(
+        indices, [&](int64_t index) -> int64_t { return inputShape[index]; });
 
     Value outputTensor = tensor::EmptyOp::create(
         rewriter, loc, targetShape, operandTensorType.getElementType());
@@ -404,6 +416,10 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp convOp) {
   auto filterType = cast<ShapedType>(convOp.getInputs()[1].getType());
   auto outputType = cast<ShapedType>(convOp.getOutputs()[0].getType());
 
+  if (!convOp.hasPureTensorSemantics())
+    return rewriter.notifyMatchFailure(
+        convOp, "expected op to have pure tensor semantics");
+
   if (!filterType.hasStaticShape())
     return rewriter.notifyMatchFailure(
         convOp, "expected a static shape for the filter");
@@ -411,11 +427,6 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp convOp) {
   if (!inputType.hasStaticShape())
     return rewriter.notifyMatchFailure(convOp,
                                        "expected a static shape for the input");
-
-  // TODO: Support dilation.
-  if (!hasAllOneValues(convOp.getDilations()))
-    return rewriter.notifyMatchFailure(convOp,
-                                       "expected all ones for dilations");
 
   Value input = convOp.getInputs()[0];
   Value filter = convOp.getInputs()[1];
@@ -435,9 +446,14 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp convOp) {
   auto loc = convOp.getLoc();
   MLIRContext *context = rewriter.getContext();
 
+  assert(isa<RankedTensorType>(filterType) &&
+         "expected filter type to be a ranked tensor");
+  auto tensorFilterType = cast<RankedTensorType>(filterType);
+
   SmallVector<ReassociationIndices> filterReassocIndices = {{0}, {1, 2, 3}};
   auto reshapedFilterType =
-      RankedTensorType::get({oc, ic * fh * fw}, inputType.getElementType());
+      RankedTensorType::get({oc, ic * fh * fw}, inputType.getElementType(),
+                            tensorFilterType.getEncoding());
   Value reshapedFilter = tensor::CollapseShapeOp::create(
       rewriter, loc, reshapedFilterType, filter, filterReassocIndices);
 
@@ -473,12 +489,12 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNchwFchwOp convOp) {
   i2cToOperExprs.owIndex = mIndicesExprs[1];
   Im2ColToInputDimsExprs inExprs = getIm2ColInputExpressions(
       i2cToOperExprs, llvm::to_vector(convOp.getStrides().getValues<int64_t>()),
-      rewriter);
+      llvm::to_vector(convOp.getDilations().getValues<int64_t>()), rewriter);
   auto inMap =
       AffineMap::inferFromExprList({ArrayRef{inExprs.bIndex, inExprs.cIndex,
                                              inExprs.hIndex, inExprs.wIndex}},
                                    rewriter.getContext())[0];
-  // im2col[n, ic*fh*fw, oh*ow] = input[n, ic, sh*oh + fh, sw*ow + fw]
+  // im2col[n, ic*fh*fw, oh*ow] = input[n, ic, sh*oh + dh*fh, sw*ow + dw*fw]
   SmallVector<AffineMap> img2colIndexingMaps = {
       inMap, AffineMap::getMultiDimIdentityMap(nloops, context)};
 
@@ -529,6 +545,10 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcFhwcOp convOp) {
   auto filterType = cast<ShapedType>(convOp.getInputs()[1].getType());
   auto outputType = cast<ShapedType>(convOp.getOutputs()[0].getType());
 
+  if (!convOp.hasPureTensorSemantics())
+    return rewriter.notifyMatchFailure(
+        convOp, "expected op to have pure tensor semantics");
+
   if (!filterType.hasStaticShape())
     return rewriter.notifyMatchFailure(
         convOp, "expected a static shape for the filter");
@@ -536,11 +556,6 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcFhwcOp convOp) {
   if (!inputType.hasStaticShape())
     return rewriter.notifyMatchFailure(convOp,
                                        "expected a static shape for the input");
-
-  // TODO: Support dilation.
-  if (!hasAllOneValues(convOp.getDilations()))
-    return rewriter.notifyMatchFailure(convOp,
-                                       "expected all ones for dilations");
 
   MLIRContext *context = rewriter.getContext();
   Value input = convOp.getInputs()[0];
@@ -560,11 +575,16 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcFhwcOp convOp) {
 
   Location loc = convOp.getLoc();
 
+  assert(isa<RankedTensorType>(filterType) &&
+         "expected filter type to be a ranked tensor");
+  auto tensorFilterType = cast<RankedTensorType>(filterType);
+
   // Reshape output and filter to the LHS and result of a "row-wise" matrix
   // multiplication.
   SmallVector<ReassociationIndices> filterReassocIndices = {{0}, {1, 2, 3}};
   auto reshapedFilterType =
-      RankedTensorType::get({oc, fh * fw * ic}, filterType.getElementType());
+      RankedTensorType::get({oc, fh * fw * ic}, filterType.getElementType(),
+                            tensorFilterType.getEncoding());
   Value reshapedFilter = tensor::CollapseShapeOp::create(
       rewriter, loc, reshapedFilterType, filter, filterReassocIndices);
 
@@ -599,10 +619,10 @@ rewriteInIm2Col(RewriterBase &rewriter, linalg::Conv2DNhwcFhwcOp convOp) {
   i2cToOperExprs.ohIndex = mIndicesExprs[0];
   i2cToOperExprs.owIndex = mIndicesExprs[1];
 
-  // im2col[n, oh*ow, fh*fw*ic] = input[n, sh*oh + fh, sw*ow + fw, ic]
+  // im2col[n, oh*ow, fh*fw*ic] = input[n, sh*oh + dh*fh, sw*ow + dw*fw, ic]
   Im2ColToInputDimsExprs inExprs = getIm2ColInputExpressions(
       i2cToOperExprs, llvm::to_vector(convOp.getStrides().getValues<int64_t>()),
-      rewriter);
+      llvm::to_vector(convOp.getDilations().getValues<int64_t>()), rewriter);
   auto inMap =
       AffineMap::inferFromExprList({ArrayRef{inExprs.bIndex, inExprs.hIndex,
                                              inExprs.wIndex, inExprs.cIndex}},

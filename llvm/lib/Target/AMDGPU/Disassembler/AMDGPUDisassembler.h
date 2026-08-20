@@ -41,12 +41,15 @@ private:
   std::unique_ptr<MCInstrInfo const> const MCII;
   const MCRegisterInfo &MRI;
   const MCAsmInfo &MAI;
+  const unsigned HwModeRegClass;
   const unsigned TargetMaxInstBytes;
   mutable ArrayRef<uint8_t> Bytes;
-  mutable uint32_t Literal;
-  mutable uint64_t Literal64;
+  mutable uint64_t Literal;
   mutable bool HasLiteral;
   mutable std::optional<bool> EnableWavefrontSize32;
+
+  // If the object's ELF e_flags enable xnack. TODO: Replace with TargetID
+  mutable bool XnackOnFromEFlags = false;
   unsigned CodeObjectVersion;
   const MCExpr *UCVersionW64Expr;
   const MCExpr *UCVersionW32Expr;
@@ -54,7 +57,7 @@ private:
 
   const MCExpr *createConstantSymbolExpr(StringRef Id, int64_t Val);
 
-  void decodeImmOperands(MCInst &MI, const MCInstrInfo &MCII) const;
+  bool decodeImmOperands(MCInst &MI, const MCInstrInfo &MCII) const;
 
 public:
   AMDGPUDisassembler(const MCSubtargetInfo &STI, MCContext &Ctx,
@@ -63,13 +66,15 @@ public:
 
   void setABIVersion(unsigned Version) override;
 
+  void emitTargetIDIfSupported(raw_ostream &OS, unsigned EFlags) const override;
+
   DecodeStatus getInstruction(MCInst &MI, uint64_t &Size,
                               ArrayRef<uint8_t> Bytes, uint64_t Address,
                               raw_ostream &CS) const override;
 
   const char* getRegClassName(unsigned RegClassID) const;
 
-  MCOperand createRegOperand(unsigned int RegId) const;
+  MCOperand createRegOperand(MCRegister Reg) const;
   MCOperand createRegOperand(unsigned RegClassID, unsigned Val) const;
   MCOperand createSRegOperand(unsigned SRegClassID, unsigned Val) const;
   MCOperand createVGPR16Operand(unsigned RegIdx, bool IsHi) const;
@@ -122,8 +127,8 @@ public:
   void convertVINTERPInst(MCInst &MI) const;
   void convertFMAanyK(MCInst &MI) const;
   void convertSDWAInst(MCInst &MI) const;
-  void convertMAIInst(MCInst &MI) const;
-  void convertWMMAInst(MCInst &MI) const;
+  bool convertMAIInst(MCInst &MI) const;
+  bool convertWMMAInst(MCInst &MI) const;
   void convertDPP8Inst(MCInst &MI) const;
   void convertMIMGInst(MCInst &MI) const;
   void convertVOP3DPPInst(MCInst &MI) const;
@@ -135,19 +140,24 @@ public:
 
   unsigned getVgprClassId(unsigned Width) const;
   unsigned getAgprClassId(unsigned Width) const;
-  unsigned getSgprClassId(unsigned Width) const;
-  unsigned getTtmpClassId(unsigned Width) const;
+
+  /// Return the SGPR/TTMP register class accepted by source decoding for
+  /// \p Width, or std::nullopt if that width has no supported encoding.
+  std::optional<unsigned> getSgprClassId(unsigned Width) const;
+  std::optional<unsigned> getTtmpClassId(unsigned Width) const;
 
   static MCOperand decodeIntImmed(unsigned Imm);
 
   MCOperand decodeMandatoryLiteralConstant(unsigned Imm) const;
   MCOperand decodeMandatoryLiteral64Constant(uint64_t Imm) const;
-  MCOperand decodeLiteralConstant(bool ExtendFP64) const;
+  MCOperand decodeLiteralConstant(const MCInstrDesc &Desc,
+                                  const MCOperandInfo &OpDesc) const;
   MCOperand decodeLiteral64Constant() const;
 
-  MCOperand decodeSrcOp(unsigned Width, unsigned Val) const;
+  MCOperand decodeSrcOp(const MCInst &Inst, unsigned Width, unsigned Val) const;
 
-  MCOperand decodeNonVGPRSrcOp(unsigned Width, unsigned Val) const;
+  MCOperand decodeNonVGPRSrcOp(const MCInst &Inst, unsigned Width,
+                               unsigned Val) const;
 
   MCOperand decodeVOPDDstYOp(MCInst &Inst, unsigned Val) const;
   MCOperand decodeSpecialReg32(unsigned Val) const;
@@ -159,8 +169,8 @@ public:
   MCOperand decodeSDWASrc32(unsigned Val) const;
   MCOperand decodeSDWAVopcDst(unsigned Val) const;
 
-  MCOperand decodeBoolReg(unsigned Val) const;
-  MCOperand decodeSplitBarrier(unsigned Val) const;
+  MCOperand decodeBoolReg(const MCInst &Inst, unsigned Val) const;
+  MCOperand decodeSplitBarrier(const MCInst &Inst, unsigned Val) const;
   MCOperand decodeDpp8FI(unsigned Val) const;
 
   MCOperand decodeVersionImm(unsigned Imm) const;
@@ -176,10 +186,14 @@ public:
   bool isGFX10() const;
   bool isGFX10Plus() const;
   bool isGFX11() const;
+  bool isGFX1170() const;
   bool isGFX11Plus() const;
   bool isGFX12() const;
   bool isGFX12Plus() const;
   bool isGFX1250() const;
+  bool isGFX1250Plus() const;
+  bool isGFX13() const;
+  bool isGFX13Plus() const;
 
   bool hasArchitectedFlatScratch() const;
   bool hasKernargPreload() const;

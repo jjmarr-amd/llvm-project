@@ -85,6 +85,7 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
   if (options.features.IsEnabled(LanguageFeature::OpenACC) ||
       (options.prescanAndReformat && noneOfTheAbove)) {
     prescanner.AddCompilerDirectiveSentinel("$acc");
+    prescanner.AddCompilerDirectiveSentinel("@acc");
   }
   if (options.features.IsEnabled(LanguageFeature::OpenMP) ||
       (options.prescanAndReformat && noneOfTheAbove)) {
@@ -95,6 +96,9 @@ const SourceFile *Parsing::Prescan(const std::string &path, Options options) {
       (options.prescanAndReformat && noneOfTheAbove)) {
     prescanner.AddCompilerDirectiveSentinel("$cuf");
     prescanner.AddCompilerDirectiveSentinel("@cuf");
+  }
+  for (const auto &sentinel : options.compilerDirectiveSentinels) {
+    prescanner.AddCompilerDirectiveSentinel(sentinel);
   }
   ProvenanceRange range{allSources.AddIncludedFile(
       *sourceFile, ProvenanceRange{}, options.isModuleFile)};
@@ -275,11 +279,13 @@ void Parsing::DumpParsingLog(llvm::raw_ostream &out) const {
   log_.Dump(out, allCooked_);
 }
 
-void Parsing::Parse(llvm::raw_ostream &out) {
+void Parsing::Parse(
+    llvm::raw_ostream &out, const common::LangOptions &langOptions) {
   UserState userState{allCooked_, options_.features};
   userState.set_debugOutput(out)
       .set_instrumentedParse(options_.instrumentedParse)
-      .set_log(&log_);
+      .set_log(&log_)
+      .set_langOptions(langOptions);
   ParseState parseState{cooked()};
   parseState.set_inFixedForm(options_.isFixedForm).set_userState(&userState);
   // Don't bother managing message buffers when parsing module files.

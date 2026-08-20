@@ -38,6 +38,12 @@ struct DemapInsRewriter : public OpRewritePattern<SourceOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
 
+    for (Value in : op->getOperands())
+      if (auto stt = tryGetSparseTensorType(in);
+          stt && !stt->isIdentity() &&
+          stt->getEncoding().getDimToLvl().getNumSymbols() != 0)
+        return failure();
+
     // Demaps non-trivial inputs.
     bool changed = false;
     SmallVector<Value> deMappedIns(op->getOperands());
@@ -59,7 +65,7 @@ struct DemapInsRewriter : public OpRewritePattern<SourceOp> {
 
 // Flattens an affine expression into a list of AffineDimExprs.
 struct AffineDimCollector : public AffineExprVisitor<AffineDimCollector> {
-  explicit AffineDimCollector(unsigned dimNum) : dims(dimNum){};
+  explicit AffineDimCollector(unsigned dimNum) : dims(dimNum) {};
   void visitDimExpr(AffineDimExpr expr) { dims.set(expr.getPosition()); }
   BitVector dims;
 };
@@ -67,7 +73,7 @@ struct AffineDimCollector : public AffineExprVisitor<AffineDimCollector> {
 // Flattens an affine expression into a list of AffineDimExprs.
 struct AffineExprAdmissibleVisitor
     : public AffineExprVisitor<AffineExprAdmissibleVisitor> {
-  explicit AffineExprAdmissibleVisitor(bool isOutput) : isOutput(isOutput){};
+  explicit AffineExprAdmissibleVisitor(bool isOutput) : isOutput(isOutput) {};
 
   // We only allow AffineDimExpr on output.
   void visitAddExpr(AffineBinaryOpExpr expr) {
@@ -407,7 +413,10 @@ public:
 };
 
 struct GenericOpScheduler : public OpRewritePattern<linalg::GenericOp> {
-  using OpRewritePattern::OpRewritePattern;
+  GenericOpScheduler(MLIRContext *context,
+                     sparse_tensor::LoopOrderingStrategy strategy)
+      : OpRewritePattern<linalg::GenericOp>(context), strategy(strategy) {}
+
   LogicalResult matchAndRewrite(linalg::GenericOp linalgOp,
                                 PatternRewriter &rewriter) const override {
     if (linalgOp.getNumDpsInits() != 1 || !linalgOp.hasPureTensorSemantics() ||
@@ -420,7 +429,8 @@ struct GenericOpScheduler : public OpRewritePattern<linalg::GenericOp> {
     if (linalgOp->hasAttr(sorted))
       return failure();
 
-    auto scheduler = IterationGraphSorter::fromGenericOp(linalgOp);
+    // Pass strategy to IterationGraphSorter.
+    auto scheduler = IterationGraphSorter::fromGenericOp(linalgOp, strategy);
     bool isAdmissible = false;
     AffineMap order;
     // A const list of all masks that we used for iteration graph
@@ -582,6 +592,9 @@ private:
     // TODO: convert more than one?
     return failure();
   }
+
+private:
+  sparse_tensor::LoopOrderingStrategy strategy;
 };
 
 //===----------------------------------------------------------------------===//
@@ -598,6 +611,8 @@ struct TensorAllocDemapper : public OpRewritePattern<AllocOp> {
 
     Location loc = op.getLoc();
     auto stt = getSparseTensorType(op.getResult());
+    if (stt.getEncoding().getDimToLvl().getNumSymbols() != 0)
+      return failure();
 
     SmallVector<Value> maxDimCrds;
     maxDimCrds.reserve(stt.getDimRank());
@@ -626,14 +641,13 @@ struct TensorAllocDemapper : public OpRewritePattern<AllocOp> {
     }
 
     assert(dynSz.empty()); // should have consumed all.
-    rewriter.startOpModification(op);
-    op->setOperands(dynLvlSzs);
-    op.getResult().setType(stt.getDemappedType());
-    rewriter.finalizeOpModification(op);
-    rewriter.setInsertionPointAfter(op);
 
-    Value t = genRemap(rewriter, stt.getEncoding(), op.getResult());
-    rewriter.replaceAllUsesExcept(op.getResult(), t, t.getDefiningOp());
+    // Create a new op to let the MLIR builder calculate the correct metadata.
+    auto allocOp =
+        AllocOp::create(rewriter, loc, stt.getDemappedType(), dynLvlSzs);
+
+    Value t = genRemap(rewriter, stt.getEncoding(), allocOp.getResult());
+    rewriter.replaceOp(op, t);
     return success();
   }
 };
@@ -668,6 +682,8 @@ struct SparseAssembleDemapper : public OpRewritePattern<AssembleOp> {
 
     assert(hasAnySparseResult(op));
     auto stt = getSparseTensorType(op.getResult());
+    if (stt.getEncoding().getDimToLvl().getNumSymbols() != 0)
+      return failure();
     rewriter.modifyOpInPlace(
         op, [&op, &stt]() { op.getResult().setType(stt.getDemappedType()); });
     rewriter.setInsertionPointAfter(op);
@@ -786,12 +802,13 @@ struct ForeachOpDemapper
 
 } // namespace
 
-void mlir::populateSparseReinterpretMap(RewritePatternSet &patterns,
-                                        ReinterpretMapScope scope) {
+void mlir::populateSparseReinterpretMap(
+    RewritePatternSet &patterns, ReinterpretMapScope scope,
+    sparse_tensor::LoopOrderingStrategy strategy) {
   if (scope == ReinterpretMapScope::kAll ||
       scope == ReinterpretMapScope::kGenericOnly) {
-    patterns.add<GenericOpReinterpretMap, GenericOpScheduler>(
-        patterns.getContext());
+    patterns.add<GenericOpReinterpretMap>(patterns.getContext());
+    patterns.add<GenericOpScheduler>(patterns.getContext(), strategy);
   }
   if (scope == ReinterpretMapScope::kAll ||
       scope == ReinterpretMapScope::kExceptGeneric) {

@@ -19,16 +19,29 @@ include "mlir/Dialect/Vector/Interfaces/MaskableOpInterface.td"
 include "mlir/Dialect/Vector/Interfaces/MaskingOpInterface.td"
 include "mlir/Dialect/Vector/IR/Vector.td"
 include "mlir/Dialect/Vector/IR/VectorAttributes.td"
+include "mlir/Interfaces/AlignmentAttrInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/IndexingMapOpInterface.td"
 include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/MemOpInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/VectorInterfaces.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
 include "mlir/IR/BuiltinAttributes.td"
 include "mlir/IR/EnumAttr.td"
+
+// Type constraint helpers for the vector dialect.
+
+// Any vector of any rank whose element type is not i0 (zero-bitwidth integer).
+// Floats, index, and integers with width >= 1 are all accepted.
+def AnyVectorOfNonI0Elem : VectorOfAnyRankOf<[
+    Type<CPred<"!$_self.isInteger(0)">, "non-zero-bitwidth type">]>;
+
+// Like AnyVectorOfNonI0Elem but additionally requires rank >= 1.
+def AnyVectorOfNonZeroRankNonI0Elem : VectorOfNonZeroRankOf<[
+    Type<CPred<"!$_self.isInteger(0)">, "non-zero-bitwidth type">]>;
 
 // TODO: Add an attribute to specify a different algebra with operators other
 // than the current set: {*, +}.
@@ -39,14 +52,18 @@ def Vector_ContractionOp :
       PredOpTrait<"lhs and rhs have same element type", TCopVTEtIsSameAs<0, 1>>,
       PredOpTrait<"third operand acc and result have same element type",
                   TCresVTEtIsSameAsOpBase<0, 2>>,
+      DeclareOpInterfaceMethods<ArithFastMathInterface>,
       DeclareOpInterfaceMethods<MaskableOpInterface>,
       DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>
     ]>,
-    Arguments<(ins AnyVectorOfNonZeroRank:$lhs, AnyVectorOfNonZeroRank:$rhs, AnyType:$acc,
+    Arguments<(ins AnyVectorOfNonZeroRankNonI0Elem:$lhs, AnyVectorOfNonZeroRankNonI0Elem:$rhs, AnyType:$acc,
                ArrayAttr:$indexing_maps,
                Vector_IteratorTypeArrayAttr:$iterator_types,
                DefaultValuedAttr<Vector_CombiningKindAttr,
-                                 "CombiningKind::ADD">:$kind)>,
+                                 "CombiningKind::ADD">:$kind,
+               DefaultValuedAttr<
+                 Arith_FastMathAttr,
+                 "::mlir::arith::FastMathFlags::none">:$fastmath)>,
     Results<(outs AnyType)> {
   let summary = "vector contraction operation";
   let description = [{
@@ -167,7 +184,9 @@ def Vector_ContractionOp :
       "ArrayRef<IteratorType>":$iteratorTypes)>,
     OpBuilder<(ins "Value":$lhs, "Value":$rhs, "Value":$acc,
       "ArrayAttr":$indexingMaps, "ArrayAttr":$iteratorTypes,
-      "CombiningKind":$kind)>
+      "CombiningKind":$kind,
+      CArg<"::mlir::arith::FastMathFlags",
+           "::mlir::arith::FastMathFlags::none">:$fastMathFlags)>
   ];
   let extraClassDeclaration = [{
     VectorType getLhsType() {
@@ -237,7 +256,7 @@ def Vector_ReductionOp :
      DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>
     ]>,
     Arguments<(ins Vector_CombiningKindAttr:$kind,
-               AnyVectorOfAnyRank:$vector,
+               AnyVectorOfNonI0Elem:$vector,
                Optional<AnyType>:$acc,
                DefaultValuedAttr<
                  Arith_FastMathAttr,
@@ -297,7 +316,7 @@ def Vector_MultiDimReductionOp :
      DeclareOpInterfaceMethods<VectorUnrollOpInterface,
                                ["getShapeForUnroll"]>]>,
     Arguments<(ins Vector_CombiningKindAttr:$kind,
-                   AnyVectorOfNonZeroRank:$source,
+                   AnyVectorOfNonZeroRankNonI0Elem:$source,
                    AnyType:$acc,
                    DenseI64ArrayAttr:$reduction_dims)>,
     Results<(outs AnyType:$dest)> {
@@ -520,7 +539,8 @@ def ResultIsDoubleSourceVectorType : TypesMatchWith<
 
 def Vector_InterleaveOp :
   Vector_Op<"interleave", [Pure, AllTypesMatch<["lhs", "rhs"]>,
-    ResultIsDoubleSourceVectorType]> {
+    ResultIsDoubleSourceVectorType,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>]> {
   let summary = "constructs a vector by interleaving two input vectors";
   let description = [{
     The interleave operation constructs a new vector by interleaving the
@@ -564,6 +584,8 @@ def Vector_InterleaveOp :
       return ::llvm::cast<VectorType>(getResult().getType());
     }
   }];
+  let hasCanonicalizer = 1;
+  let hasFolder = 1;
 }
 
 class ResultIsHalfSourceVectorType<string result> : TypesMatchWith<
@@ -596,7 +618,8 @@ def Vector_DeinterleaveOp :
   Vector_Op<"deinterleave", [Pure,
     SourceVectorEvenElementCount,
     ResultIsHalfSourceVectorType<"res1">,
-    AllTypesMatch<["res1", "res2"]>
+    AllTypesMatch<["res1", "res2"]>,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>
     ]> {
       let summary = "constructs two vectors by deinterleaving an input vector";
       let description = [{
@@ -651,7 +674,7 @@ def Vector_ExtractOp :
      DeclareOpInterfaceMethods<InferIntRangeInterface, ["inferResultRanges"]>,
      PredOpTrait<"operand and result have same element type",
                  TCresVTEtIsSameAsOpBase<0, 0>>,
-     InferTypeOpAdaptorWithIsCompatible]> {
+     InferTypeOpAdaptor]> {
   let summary = "extract operation";
   let description = [{
     Extracts an (n − k)-D result sub-vector from an n-D source vector at a
@@ -708,11 +731,6 @@ def Vector_ExtractOp :
     /// Return "true" if the op has at least one dynamic position.
     bool hasDynamicPosition() {
       return !getDynamicPosition().empty();
-    }
-
-    /// Wrapper for getSource, which replaced getVector.
-    [[deprecated("Use getSource instead!")]] ::mlir::Value getVector() {
-      return getSource();
     }
   }];
 
@@ -805,6 +823,7 @@ def Vector_ToElementsOp : Vector_Op<"to_elements", [
   let results = (outs Variadic<AnyType>:$elements);
   let assemblyFormat = "$source attr-dict `:` type($source)";
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def Vector_FromElementsOp : Vector_Op<"from_elements", [
@@ -1028,10 +1047,6 @@ def Vector_ScalableExtractOp :
     VectorType getResultVectorType() {
       return ::llvm::cast<VectorType>(getResult().getType());
     }
-    /// Wrapper for getSource, which replaced getVector.
-    [[deprecated("Use getSource instead!")]] ::mlir::Value getVector() {
-      return getSource();
-    }
   }];
 }
 
@@ -1100,10 +1115,10 @@ def Vector_OuterProductOp :
     PredOpTrait<"rhs operand and result have same element type",
                 TCresVTEtIsSameAsOpBase<0, 1>>,
     DeclareOpInterfaceMethods<MaskableOpInterface>]>,
-    Arguments<(ins AnyVectorOfNonZeroRank:$lhs, AnyType:$rhs,
-               Optional<AnyVectorOfNonZeroRank>:$acc,
+    Arguments<(ins AnyVectorOfNonZeroRankNonI0Elem:$lhs, AnyType:$rhs,
+               Optional<AnyVectorOfNonZeroRankNonI0Elem>:$acc,
                DefaultValuedAttr<Vector_CombiningKindAttr, "CombiningKind::ADD">:$kind)>,
-    Results<(outs AnyVectorOfNonZeroRank)> {
+    Results<(outs AnyVectorOfNonZeroRankNonI0Elem)> {
   let summary = "vector outerproduct with optional fused add";
   let description = [{
     Takes 2 1-D vectors and returns the 2-D vector containing the outer-product,
@@ -1226,10 +1241,6 @@ def Vector_ExtractStridedSliceOp :
         return ::llvm::cast<IntegerAttr>(attr).getInt() != 1;
       });
     }
-    /// Wrapper for getSource, which replaced getVector.
-    [[deprecated("Use getSource instead!")]] ::mlir::Value getVector() {
-      return getSource();
-    }
   }];
   let hasCanonicalizer = 1;
   let hasFolder = 1;
@@ -1246,6 +1257,7 @@ def Vector_TransferReadOp :
       DeclareOpInterfaceMethods<MaskableOpInterface>,
       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
       DeclareOpInterfaceMethods<ConditionallySpeculatable>,
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
       AttrSizedOperandSegments,
       DestinationStyleOpInterface
     ]>,
@@ -1446,6 +1458,7 @@ def Vector_TransferReadOp :
   let builders = [
     /// 1. Builder that sets padding to `padding` or poison if not provided and
     /// an empty mask (variant with attrs).
+    /// If `padding` is null, a poison value is used.
     OpBuilder<(ins "VectorType":$vectorType,
                    "Value":$source,
                    "ValueRange":$indices,
@@ -1453,7 +1466,10 @@ def Vector_TransferReadOp :
                    "AffineMapAttr":$permutationMapAttr,
                    "ArrayAttr":$inBoundsAttr)>,
     /// 2. Builder that sets padding to `padding` or poison if not provided and
-    /// an empty mask (variant without attrs).
+    /// an empty mask (variant without attrs). 
+    /// If `padding` is null, a poison value is used.
+    /// If `permutationMap` is null, a minor identity map is used.
+    /// If `inBounds` is null, an empty mask is used.
     OpBuilder<(ins "VectorType":$vectorType,
                    "Value":$source,
                    "ValueRange":$indices,
@@ -1462,6 +1478,8 @@ def Vector_TransferReadOp :
                    CArg<"std::optional<ArrayRef<bool>>", "::std::nullopt">:$inBounds)>,
     /// 3. Builder that sets padding to `padding` or poison if not provided and
     /// permutation map to 'getMinorIdentityMap'.
+    /// If `padding` is null, a poison value is used.
+    /// If `inBounds` is null, an empty mask is used.
     OpBuilder<(ins "VectorType":$vectorType,
                    "Value":$source,
                    "ValueRange":$indices,
@@ -1493,6 +1511,7 @@ def Vector_TransferWriteOp :
       DeclareOpInterfaceMethods<MaskableOpInterface>,
       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
       DeclareOpInterfaceMethods<ConditionallySpeculatable>,
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
       AttrSizedOperandSegments,
       DestinationStyleOpInterface
   ]>,
@@ -1619,7 +1638,8 @@ def Vector_TransferWriteOp :
                    "ValueRange":$indices,
                    "AffineMapAttr":$permutationMapAttr,
                    "ArrayAttr":$inBoundsAttr)>,
-    /// 3. Builder with type inference that sets an empty mask (variant without attrs).
+    /// 3. Builder with type inference that sets an empty mask (variant without
+    /// attrs). If `permutationMap` is null, a minor identity map is used.
     OpBuilder<(ins "Value":$vector,
                    "Value":$dest,
                    "ValueRange":$indices,
@@ -1647,8 +1667,11 @@ def Vector_TransferWriteOp :
   let hasVerifier = 1;
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_LoadOp : Vector_Op<"load", [
     DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>,
+    DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+    DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
   ]> {
   let summary = "reads an n-D slice of memory into an n-D vector";
   let description = [{
@@ -1694,6 +1717,9 @@ def Vector_LoadOp : Vector_Op<"load", [
     ```mlir
     %result = vector.load %memref[%i, %j] : memref<200x100xvector<4x8xf32>>, vector<4x8xf32>
     ```
+
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
 
     Representation-wise, the 'vector.load' operation permits out-of-bounds
     reads. Support and implementation of out-of-bounds vector loads is
@@ -1763,8 +1789,11 @@ def Vector_LoadOp : Vector_Op<"load", [
       "$base `[` $indices `]` attr-dict `:` type($base) `,` type($result)";
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_StoreOp : Vector_Op<"store", [
     DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>,
+    DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+    DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
   ]> {
   let summary = "writes an n-D vector to an n-D slice of memory";
   let description = [{
@@ -1809,6 +1838,9 @@ def Vector_StoreOp : Vector_Op<"store", [
     ```mlir
     vector.store %valueToStore, %memref[%i, %j] : memref<200x100xvector<4x8xf32>>, vector<4x8xf32>
     ```
+
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
 
     Representation-wise, the 'vector.store' operation permits out-of-bounds
     writes. Support and implementation of out-of-bounds vector stores are
@@ -1868,8 +1900,12 @@ def Vector_StoreOp : Vector_Op<"store", [
                        "`:` type($base) `,` type($valueToStore)";
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_MaskedLoadOp :
-  Vector_Op<"maskedload">,
+  Vector_Op<"maskedload", [
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+      DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
+    ]>,
     Arguments<(ins Arg<AnyMemRef, "", [MemRead]>:$base,
                Variadic<Index>:$indices,
                VectorOfNonZeroRankOf<[I1]>:$mask,
@@ -1910,6 +1946,9 @@ def Vector_MaskedLoadOp :
     %1 = vector.maskedload %base[%i, %j], %mask, %pass_thru
        : memref<?x?xf32>, vector<16xi1>, vector<16xf32> into vector<16xf32>
     ```
+
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
 
     An optional `alignment` attribute allows to specify the byte alignment of the
     load operation. It must be a positive power of 2. The operation must access
@@ -1960,8 +1999,12 @@ def Vector_MaskedLoadOp :
   ];
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_MaskedStoreOp :
-  Vector_Op<"maskedstore">,
+  Vector_Op<"maskedstore", [
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+      DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
+    ]>,
     Arguments<(ins Arg<AnyMemRef, "", [MemWrite]>:$base,
                Variadic<Index>:$indices,
                VectorOfNonZeroRankOf<[I1]>:$mask,
@@ -2002,6 +2045,9 @@ def Vector_MaskedStoreOp :
       : memref<?x?xf32>, vector<16xi1>, vector<16xf32>
     ```
 
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
+
     An optional `alignment` attribute allows to specify the byte alignment of the
     store operation. It must be a positive power of 2. The operation must access
     memory at an address aligned to this boundary. Violating this requirement
@@ -2041,7 +2087,9 @@ def Vector_MaskedStoreOp :
 def Vector_GatherOp :
   Vector_Op<"gather", [
     DeclareOpInterfaceMethods<MaskableOpInterface>,
-    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>
+    DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>,
+    DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
   ]>,
     Arguments<(ins Arg<TensorOrMemRef<[AnyType]>, "", [MemRead]>:$base,
                Variadic<Index>:$offsets,
@@ -2094,6 +2142,9 @@ def Vector_GatherOp :
     during progressively lowering to bring other memory operations closer to
     hardware ISA support for a gather.
 
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
+
     An optional `alignment` attribute allows to specify the byte alignment of the
     gather operation. It must be a positive power of 2. The operation must access
     memory at an address aligned to this boundary. Violating this requirement
@@ -2143,22 +2194,25 @@ def Vector_GatherOp :
   ];
 }
 
-def Vector_ScatterOp :
-  Vector_Op<"scatter">,
-    Arguments<(ins Arg<AnyMemRef, "", [MemWrite]>:$base,
-               Variadic<Index>:$offsets,
-               VectorOfNonZeroRankOf<[AnyInteger, Index]>:$indices,
-               VectorOfNonZeroRankOf<[I1]>:$mask,
-               AnyVectorOfNonZeroRank:$valueToStore,
-               OptionalAttr<IntValidAlignment<I64Attr>>: $alignment)> {
+def Vector_ScatterOp
+    : Vector_Op<"scatter",
+                [DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+                 DeclareOpInterfaceMethods<AlignmentAttrOpInterface>]>,
+      Arguments<(ins Arg<TensorOrMemRef<[AnyType]>, "", [MemWrite]>:$base,
+          Variadic<Index>:$offsets,
+          VectorOfNonZeroRankOf<[AnyInteger, Index]>:$indices,
+          VectorOfNonZeroRankOf<[I1]>:$mask,
+          AnyVectorOfNonZeroRank:$valueToStore,
+          OptionalAttr<IntValidAlignment<I64Attr>>:$alignment)>,
+      Results<(outs Optional<AnyRankedTensor>:$result)> {
 
   let summary = [{
-    scatters elements from a vector into memory as defined by an index vector
+    scatters elements from a vector into memory or ranked tensor as defined by an index vector
     and a mask vector
   }];
 
   let description = [{
-    The scatter operation stores elements from a n-D vector into memory as
+    The scatter operation stores elements from a n-D vector into memory or ranked tensor as
     defined by a base with indices and an additional n-D index vector, but
     only if the corresponding bit in a n-D mask vector is set. Otherwise, no
     action is taken for that element. Informally the semantics are:
@@ -2184,6 +2238,9 @@ def Vector_ScatterOp :
     correspond to those of the `llvm.masked.scatter`
     [intrinsic](https://llvm.org/docs/LangRef.html#llvm-masked-scatter-intrinsics).
 
+    The memref must have non-negative strides. Negative strides are not supported
+    and will trigger a verification error.
+
     An optional `alignment` attribute allows to specify the byte alignment of the
     scatter operation. It must be a positive power of 2. The operation must access
     memory at an address aligned to this boundary. Violating this requirement
@@ -2201,38 +2258,39 @@ def Vector_ScatterOp :
   }];
 
   let extraClassDeclaration = [{
-    MemRefType getMemRefType() { return getBase().getType(); }
+    ShapedType getBaseType() { return getBase().getType(); }
     VectorType getIndexVectorType() { return getIndices().getType(); }
     VectorType getMaskVectorType() { return getMask().getType(); }
     VectorType getVectorType() { return getValueToStore().getType(); }
   }];
 
-  let assemblyFormat =
-      "$base `[` $offsets `]` `[` $indices `]` `,` "
-      "$mask `,` $valueToStore attr-dict `:` type($base) `,` "
-      "type($indices)  `,` type($mask) `,` type($valueToStore)";
+  let assemblyFormat = "$base `[` $offsets `]` `[` $indices `]` `,` "
+                       "$mask `,` $valueToStore attr-dict `:` type($base) `,` "
+                       "type($indices)  `,` type($mask) `,` "
+                       "type($valueToStore) (`->` type($result)^)?";
   let hasCanonicalizer = 1;
   let hasVerifier = 1;
 
-  let builders = [
-    OpBuilder<(ins "Value":$base,
-                   "ValueRange":$indices,
-                   "Value":$index_vec,
-                   "Value":$mask,
-                   "Value":$valueToStore,
-                   CArg<"llvm::MaybeAlign", "llvm::MaybeAlign()">: $alignment), [{
-      return build($_builder, $_state, base, indices, index_vec, mask, valueToStore,
+  let builders = [OpBuilder<
+      (ins "Type":$resultType, "Value":$base, "ValueRange":$indices,
+          "Value":$index_vec, "Value":$mask, "Value":$valueToStore,
+          CArg<"llvm::MaybeAlign", "llvm::MaybeAlign()">:$alignment),
+      [{
+      return build($_builder, $_state, resultType, base, indices, index_vec, mask, valueToStore,
                    alignment.has_value() ? $_builder.getI64IntegerAttr(alignment->value()) :
                                     nullptr);
-    }]>
-  ];
+    }]>];
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_ExpandLoadOp :
-  Vector_Op<"expandload">,
+  Vector_Op<"expandload", [
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+      DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
+    ]>,
     Arguments<(ins Arg<AnyMemRef, "", [MemRead]>:$base,
                Variadic<Index>:$indices,
-               FixedVectorOfNonZeroRankOf<[I1]>:$mask,
+               VectorOfNonZeroRankOf<[I1]>:$mask,
                AnyVectorOfNonZeroRank:$pass_thru,
                OptionalAttr<IntValidAlignment<I64Attr>>: $alignment)>,
     Results<(outs AnyVectorOfNonZeroRank:$result)> {
@@ -2270,8 +2328,6 @@ def Vector_ExpandLoadOp :
     load operation. It must be a positive power of 2. The operation must access
     memory at an address aligned to this boundary. Violating this requirement
     triggers immediate undefined behavior.
-
-    Note, at the moment this Op is only available for fixed-width vectors.
 
     Examples:
 
@@ -2316,11 +2372,15 @@ def Vector_ExpandLoadOp :
   ];
 }
 
+// Promises IndexedAccessOpInterface.
 def Vector_CompressStoreOp :
-  Vector_Op<"compressstore">,
+  Vector_Op<"compressstore", [
+      DeclareOpInterfaceMethods<MemorySpaceCastConsumerOpInterface>,
+      DeclareOpInterfaceMethods<AlignmentAttrOpInterface>
+    ]>,
     Arguments<(ins Arg<AnyMemRef, "", [MemWrite]>:$base,
                Variadic<Index>:$indices,
-               FixedVectorOfNonZeroRankOf<[I1]>:$mask,
+               VectorOfNonZeroRankOf<[I1]>:$mask,
                AnyVectorOfNonZeroRank:$valueToStore,
                OptionalAttr<IntValidAlignment<I64Attr>>: $alignment)> {
 
@@ -2357,8 +2417,6 @@ def Vector_CompressStoreOp :
     store operation. It must be a positive power of 2. The operation must access
     memory at an address aligned to this boundary. Violating this requirement
     triggers immediate undefined behavior.
-
-    Note, at the moment this Op is only available for fixed-width vectors.
 
     Examples:
 
@@ -2401,6 +2459,7 @@ def Vector_CompressStoreOp :
 
 def Vector_ShapeCastOp :
   Vector_Op<"shape_cast", [Pure,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>,
     DeclareOpInterfaceMethods<InferIntRangeInterface, ["inferResultRanges"]>
   ]>,
     Arguments<(ins AnyVectorOfAnyRank:$source)>,
@@ -2434,6 +2493,9 @@ def Vector_ShapeCastOp :
     VectorType getResultVectorType() {
       return ::llvm::cast<VectorType>(getResult().getType());
     }
+    // Return true if this Op is effectively a vector.broadcast (i.e. the input
+    // and output shapes satisfy the vector.broadcast constraints).
+    bool isBroadcastLike();
   }];
   let assemblyFormat = "$source attr-dict `:` type($source) `to` type($result)";
   let hasFolder = 1;
@@ -2442,9 +2504,10 @@ def Vector_ShapeCastOp :
 }
 
 def Vector_BitCastOp :
-  Vector_Op<"bitcast", [Pure, AllRanksMatch<["source", "result"]>]>,
-    Arguments<(ins AnyVectorOfAnyRank:$source)>,
-    Results<(outs AnyVectorOfAnyRank:$result)>{
+  Vector_Op<"bitcast", [Pure, AllRanksMatch<["source", "result"]>,
+    DeclareOpInterfaceMethods<VectorUnrollOpInterface, ["getShapeForUnroll"]>]>,
+    Arguments<(ins AnyVectorOfNonI0Elem:$source)>,
+    Results<(outs AnyVectorOfNonI0Elem:$result)>{
   let summary = "bitcast casts between vectors";
   let description = [{
     The bitcast operation casts between vectors of the same rank, the minor 1-D
@@ -2523,7 +2586,9 @@ def Vector_TypeCastOp :
 }
 
 def Vector_ConstantMaskOp :
-  Vector_Op<"constant_mask", [Pure]>,
+  Vector_Op<"constant_mask", [Pure,
+   DeclareOpInterfaceMethods<VectorUnrollOpInterface>
+   ]>,
     Arguments<(ins DenseI64ArrayAttr:$mask_dim_sizes)>,
     Results<(outs VectorOfAnyRankOf<[I1]>)> {
   let summary = "creates a constant vector mask";
@@ -2581,8 +2646,10 @@ def Vector_ConstantMaskOp :
 }
 
 def Vector_CreateMaskOp :
-  Vector_Op<"create_mask", [Pure]>,
-    Arguments<(ins Variadic<Index>:$operands)>,
+  Vector_Op<"create_mask", [Pure,
+   DeclareOpInterfaceMethods<VectorUnrollOpInterface>
+   ]>,
+    Arguments<(ins Variadic<Index>:$mask_dim_sizes)>,
     Results<(outs VectorOfAnyRankOf<[I1]>)> {
   let summary = "creates a vector mask";
   let description = [{
@@ -2628,7 +2695,7 @@ def Vector_CreateMaskOp :
 
   let hasCanonicalizer = 1;
   let hasVerifier = 1;
-  let assemblyFormat = "$operands attr-dict `:` type(results)";
+  let assemblyFormat = "$mask_dim_sizes attr-dict `:` type(results)";
 }
 
 def Vector_MaskOp : Vector_Op<"mask", [
@@ -2874,53 +2941,6 @@ def Vector_PrintOp :
     }];
 }
 
-//===----------------------------------------------------------------------===//
-// SplatOp
-//===----------------------------------------------------------------------===//
-
-def Vector_SplatOp : Vector_Op<"splat", [
-    Pure,
-    DeclareOpInterfaceMethods<InferIntRangeInterface, ["inferResultRanges"]>,
-    TypesMatchWith<"operand type matches element type of result",
-                   "aggregate", "input",
-                   "::llvm::cast<VectorType>($_self).getElementType()">
-  ]> {
-  let summary = "vector splat or broadcast operation";
-  let description = [{
-    Note: This operation is deprecated. Please use vector.broadcast.
-
-    Broadcast the operand to all elements of the result vector. The type of the
-    operand must match the element type of the vector type.
-
-    Example:
-
-    ```mlir
-    %s = arith.constant 10.1 : f32
-    %t = vector.splat %s : vector<8x16xf32>
-    ```
-
-    This operation is deprecated, the preferred representation of the above is:
-
-    ```mlir
-    %s = arith.constant 10.1 : f32
-    %t = vector.broadcast %s : f32 to vector<8x16xf32>
-    ```
-  }];
-
-  let arguments = (ins AnyType:$input);
-  let results = (outs AnyVectorOfAnyRank:$aggregate);
-
-  let builders = [
-    OpBuilder<(ins "Value":$element, "Type":$aggregateType),
-    [{ build($_builder, $_state, aggregateType, element); }]>];
-  let assemblyFormat = "$input attr-dict `:` type($aggregate)";
-
-  let hasFolder = 1;
-
-  // vector.splat is deprecated, and vector.broadcast should be used instead.
-  // Canonicalize vector.splat to vector.broadcast.
-  let hasCanonicalizer = 1;
-}
 
 //===----------------------------------------------------------------------===//
 // VectorScaleOp
@@ -2970,12 +2990,12 @@ def Vector_ScanOp :
     AllTypesMatch<["source", "dest"]>,
     AllTypesMatch<["initial_value", "accumulated_value"]> ]>,
     Arguments<(ins Vector_CombiningKindAttr:$kind,
-                   AnyVectorOfNonZeroRank:$source,
-                   AnyVectorOfAnyRank:$initial_value,
+                   AnyVectorOfNonZeroRankNonI0Elem:$source,
+                   AnyVectorOfNonI0Elem:$initial_value,
                    I64Attr:$reduction_dim,
                    BoolAttr:$inclusive)>,
-    Results<(outs AnyVectorOfNonZeroRank:$dest,
-                  AnyVectorOfAnyRank:$accumulated_value)> {
+    Results<(outs AnyVectorOfNonZeroRankNonI0Elem:$dest,
+                  AnyVectorOfNonI0Elem:$accumulated_value)> {
   let summary = "Scan operation";
   let description = [{
     Performs an inclusive/exclusive scan on an n-D vector along a single
@@ -3017,6 +3037,10 @@ def Vector_ScanOp :
 // VectorStepOp
 //===----------------------------------------------------------------------===//
 
+def VectorStepElementType : Type<
+  CPred<"::llvm::isa<::mlir::IndexType>($_self) || ($_self.isSignlessInteger() && $_self.getIntOrFloatBitWidth() >= 8)">,
+  "index or signless integer of at least 8 bits">;
+
 def Vector_StepOp : Vector_Op<"step", [
     Pure,
     DeclareOpInterfaceMethods<VectorUnrollOpInterface>,
@@ -3024,21 +3048,27 @@ def Vector_StepOp : Vector_Op<"step", [
   ]> {
   let summary = "A linear sequence of values from 0 to N";
   let description = [{
-    A `step` operation produces an index vector, i.e. a 1-D vector of values of
-    index type that represents a linear sequence from 0 to N-1, where N is the
-    number of elements in the `result` vector.
+    A `step` operation produces a 1-D vector representing a linear sequence from
+    0 to N-1, where N is the number of elements in the `result` vector.
+
+    The result element type must be `index` or a signless integer of at least 8
+    bits. If the sequence value exceeds the allowed limit for the element type
+    then the result for that lane is truncated.
 
     Supports fixed-width and scalable vectors.
 
     Examples:
 
     ```mlir
-    %0 = vector.step : vector<4xindex> ; [0, 1, 2, 3]
-    %1 = vector.step : vector<[4]xindex> ; [0, 1, .., <vscale * 4 - 1>]
+    %0 = vector.step : vector<4xindex>   // [0, 1, 2, 3]
+    %1 = vector.step : vector<4xi32>     // [0, 1, 2, 3]
+    %2 = vector.step : vector<258xi8>    // [0, 1, .., 255, 0, 1]
+    %3 = vector.step : vector<[4]xindex> // [0, 1, .., <vscale * 4 - 1>]
     ```
   }];
-  let results = (outs VectorOfRankAndType<[1], [Index]>:$result);
+  let results = (outs VectorOfRankAndType<[1], [VectorStepElementType]>:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
+  let hasCanonicalizer = 1;
 }
 
 def Vector_YieldOp : Vector_Op<"yield", [

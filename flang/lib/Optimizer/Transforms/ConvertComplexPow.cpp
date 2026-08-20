@@ -6,7 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "flang/Common/static-multimap-view.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/Transforms/Passes.h"
@@ -83,9 +82,7 @@ void ConvertComplexPowPass::runOnOperation() {
         call.setFastmathAttr(fmf);
       powIop.replaceAllUsesWith(call.getResult(0));
       powIop.erase();
-    }
-
-    if (auto powOp = dyn_cast<complex::PowOp>(op)) {
+    } else if (auto powOp = dyn_cast<complex::PowOp>(op)) {
       builder.setInsertionPoint(powOp);
       Location loc = powOp.getLoc();
       auto complexTy = cast<ComplexType>(powOp.getType());

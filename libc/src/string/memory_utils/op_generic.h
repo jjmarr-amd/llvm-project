@@ -41,12 +41,22 @@ static_assert((UINTPTR_MAX == 4294967295U) ||
               "We currently only support 32- or 64-bit platforms");
 
 #ifdef LIBC_COMPILER_IS_MSVC
-
+#ifdef LIBC_TARGET_ARCH_IS_X86
 namespace LIBC_NAMESPACE_DECL {
 using generic_v128 = __m128i;
 using generic_v256 = __m256i;
 using generic_v512 = __m512i;
 } // namespace LIBC_NAMESPACE_DECL
+#else
+// Special handling when target does not have real vector types.
+// We can potentially use uint8x16_t etc. However, MSVC does not provide
+// subscript operation.
+namespace LIBC_NAMESPACE_DECL {
+struct alignas(16) generic_v128 : public cpp::array<uint8_t, 16> {};
+struct alignas(32) generic_v256 : public cpp::array<uint8_t, 32> {};
+struct alignas(64) generic_v512 : public cpp::array<uint8_t, 64> {};
+} // namespace LIBC_NAMESPACE_DECL
+#endif
 
 #else
 namespace LIBC_NAMESPACE_DECL {
@@ -115,7 +125,7 @@ template <typename T> constexpr size_t array_size_v = array_size<T>::value;
 template <typename T> T load(CPtr src) {
   static_assert(is_element_type_v<T>);
   if constexpr (is_scalar_v<T> || is_vector_v<T>) {
-    return ::LIBC_NAMESPACE::load<T>(src);
+    return load_unaligned<T>(src);
   } else if constexpr (is_array_v<T>) {
     using value_type = typename T::value_type;
     T value;
@@ -128,7 +138,7 @@ template <typename T> T load(CPtr src) {
 template <typename T> void store(Ptr dst, T value) {
   static_assert(is_element_type_v<T>);
   if constexpr (is_scalar_v<T> || is_vector_v<T>) {
-    ::LIBC_NAMESPACE::store<T>(dst, value);
+    store_unaligned<T>(dst, value);
   } else if constexpr (is_array_v<T>) {
     using value_type = typename T::value_type;
     for (size_t i = 0; i < array_size_v<T>; ++i)
@@ -159,7 +169,8 @@ template <typename T> struct Memset {
 
   LIBC_INLINE static void block(Ptr dst, uint8_t value) {
     if constexpr (is_scalar_v<T> || is_vector_v<T>) {
-      store<T>(dst, splat<T>(value));
+      // Avoid ambiguous call due to ADL
+      generic::store<T>(dst, splat<T>(value));
     } else if constexpr (is_array_v<T>) {
       using value_type = typename T::value_type;
       const auto Splat = splat<value_type>(value);
@@ -346,7 +357,7 @@ template <typename T> struct Memmove {
 // Making the offset explicit hints the compiler to use relevant addressing mode
 // consistently.
 template <typename T> LIBC_INLINE T load(CPtr ptr, size_t offset) {
-  return ::LIBC_NAMESPACE::load<T>(ptr + offset);
+  return load_unaligned<T>(ptr + offset);
 }
 
 // Same as above but also makes sure the loaded value is in big endian format.

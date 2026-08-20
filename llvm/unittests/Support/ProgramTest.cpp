@@ -692,10 +692,18 @@ TEST_F(ProgramEnvTest, TestExecuteEmptyEnvironment) {
 
   std::string Error;
   bool ExecutionFailed;
-  int RetCode = ExecuteAndWait(Executable, argv, ArrayRef<StringRef>{}, {}, 0,
-                               0, &Error, &ExecutionFailed);
+  [[maybe_unused]] int RetCode =
+      ExecuteAndWait(Executable, argv, ArrayRef<StringRef>{}, {}, 0, 0, &Error,
+                     &ExecutionFailed);
   EXPECT_FALSE(ExecutionFailed) << Error;
+#ifndef __MINGW32__
+  // When running with an empty environment, the child process doesn't in herit
+  // the PATH variable. On MinGW, it is common for executables to require a
+  // shared libstdc++ or libc++ DLL, which may be in PATH but not in the
+  // directory of SupportTests.exe - leading to STATUS_DLL_NOT_FOUND errors.
+  // Therefore, waive this failure in MinGW environments.
   ASSERT_EQ(0, RetCode);
+#endif
 }
 
 } // end anonymous namespace
